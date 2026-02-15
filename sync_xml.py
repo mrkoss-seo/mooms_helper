@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Синхронізатор XML для Adobe Premiere Pro — v6.
+Синхронізатор XML для Adobe Premiere Pro — v7.
 
-Алгоритм: envelope cross-correlation (крос-кореляція огинаючої).
+Алгоритм: FFT крос-кореляція огинаючої (як у профі-інструментах).
 1. Референс = доріжка з більшою кількістю кліпів
 2. Сортуємо обидві доріжки хронологічно
-3. Витягуємо аудіо (ffmpeg → WAV)
-4. Обчислюємо огинаючу (форму гучності) + нормалізуємо 0..1
-5. Субсемплюємо (кожну N-ту точку) для швидкості
-6. Для кожного кліпу cam2 ковзаємо його огинаючу по огинаючій ref,
-   рахуємо Пірсонову кореляцію на кожному зсуві
-7. Максимум кореляції ≥ 0.3 → матч, зсув = позиція максимуму
-8. Без матчу → в кінець таймлайну
+3. Витягуємо аудіо (ffmpeg → WAV 8kHz mono)
+4. Обчислюємо огинаючу (форму гучності), субсемплюємо до ~100 точок/сек
+5. Для кожної пари (ref, tgt) — FFT крос-кореляція: O(N log N)
+6. Жадний 1:1 матчинг: найкращі пари першими
+7. Без матчу → в кінець таймлайну
 
-Без numpy/scipy — чистий Python + ffmpeg.
+Без numpy/scipy — чистий Python + ffmpeg + cmath для FFT.
 """
 
 import tkinter as tk
@@ -27,6 +25,7 @@ import threading
 import wave
 import struct
 import math
+import cmath
 from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -36,8 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 SAMPLE_RATE = 8000       # 8kHz — достатньо для огинаючої
 ENV_WINDOW = 1600        # вікно огинаючої (~200мс при 8000Hz)
 SUBSAMPLE = 80           # субсемплювання огинаючої (кожна 80-та точка = 100 точок/сек)
-MIN_CORR = 0.3           # мінімальна Пірсонова кореляція для матчу
-SEARCH_WINDOW = 10       # скільки рефів перевіряємо навколо search_start
+MIN_CORR = 0.10          # мінімальна нормалізована крос-кореляція для матчу
 
 
 # ─── Аудіо ───────────────────────────────────────────────────────────────────
@@ -81,7 +79,7 @@ def get_file_sort_key(clip):
 def compute_envelope(audio, window=ENV_WINDOW, subsample=SUBSAMPLE):
     """
     Огинаюча = ковзне середнє від |сигналу|, субсемпльована.
-    Повертає список float (нормалізований 0..1).
+    Повертає список float (сирі значення; FFT нормалізує сам).
     """
     n = len(audio)
     if n < window:
@@ -98,10 +96,6 @@ def compute_envelope(audio, window=ENV_WINDOW, subsample=SUBSAMPLE):
         lo = max(0, i - half_w)
         hi = min(n, i + half_w + 1)
         env.append((cumsum[hi] - cumsum[lo]) / (hi - lo))
-    # Нормалізуємо 0..1
-    mx = max(env) if env else 0.0
-    if mx > 0:
-        env = [v / mx for v in env]
     return env
 
 
@@ -116,61 +110,94 @@ def extract_fragment_audio(audio, in_frame, out_frame, timebase, sample_rate=SAM
     return audio[in_sample:out_sample]
 
 
-def pearson(a, b):
-    """Пірсонова кореляція двох списків однакової довжини. Повертає -1..1."""
-    n = len(a)
-    if n < 5:
-        return 0.0
-    sum_a = sum(a)
-    sum_b = sum(b)
-    sum_ab = sum(x * y for x, y in zip(a, b))
-    sum_a2 = sum(x * x for x in a)
-    sum_b2 = sum(x * x for x in b)
-    num = n * sum_ab - sum_a * sum_b
-    den = math.sqrt((n * sum_a2 - sum_a * sum_a) * (n * sum_b2 - sum_b * sum_b))
-    if den < 1e-12:
-        return 0.0
-    return num / den
+def _fft(x):
+    """Cooley-Tukey radix-2 FFT. Вхід: список complex, довжина = степінь 2."""
+    N = len(x)
+    if N <= 1:
+        return x
+    even = _fft(x[0::2])
+    odd = _fft(x[1::2])
+    T = [cmath.exp(-2j * cmath.pi * k / N) * odd[k] for k in range(N // 2)]
+    return [even[k] + T[k] for k in range(N // 2)] + \
+           [even[k] - T[k] for k in range(N // 2)]
 
 
-def find_offset_envelope(env_ref, env_tgt, subsample=SUBSAMPLE, sample_rate=SAMPLE_RATE):
+def _ifft(X):
+    """Обернене FFT через конъюгування."""
+    N = len(X)
+    conj_X = [x.conjugate() for x in X]
+    result = _fft(conj_X)
+    return [x.conjugate() / N for x in result]
+
+
+def _next_pow2(n):
+    """Найменша степінь 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def fft_cross_correlate(env_ref, env_tgt, subsample=SUBSAMPLE, sample_rate=SAMPLE_RATE):
     """
-    Ковзаємо env_tgt по env_ref, рахуємо Пірсонову кореляцію.
+    FFT крос-кореляція: знаходить зсув tgt відносно ref.
 
-    Повертає (offset_sec, correlation) або (0, 0) якщо не знайшли.
-    offset_sec: на скільки секунд tgt зсунути щоб збігся з ref.
+    Повертає (offset_sec, strength) де strength — нормалізована кореляція.
+    Якщо обидва сигнали плоскі (std ≈ 0) → повертає (0, 0).
     """
     n_ref = len(env_ref)
     n_tgt = len(env_tgt)
     if n_tgt < 5 or n_ref < 5:
         return 0.0, 0.0
 
-    # Якщо tgt довший за ref — теж ковзаємо, просто в обидва боки
-    # Діапазон зсувів: від -(n_tgt-1) до (n_ref-1)
-    # Але для швидкості обмежимо: tgt повністю або частково перекриває ref
-    best_corr = -2.0
-    best_offset_idx = 0
+    # Нормалізуємо: zero-mean, unit-variance
+    mean_a = sum(env_ref) / n_ref
+    mean_b = sum(env_tgt) / n_tgt
+    a = [v - mean_a for v in env_ref]
+    b = [v - mean_b for v in env_tgt]
 
-    # Мінімальне перекриття = max(5, 30% від меншого)
-    min_overlap = max(5, int(0.3 * min(n_tgt, n_ref)))
+    std_a = math.sqrt(sum(v * v for v in a) / n_ref)
+    std_b = math.sqrt(sum(v * v for v in b) / n_tgt)
 
-    for offset in range(-(n_tgt - min_overlap), n_ref - min_overlap + 1):
-        # ref[offset : offset + n_tgt] порівнюємо з tgt[0 : n_tgt]
-        ref_start = max(0, offset)
-        ref_end = min(n_ref, offset + n_tgt)
-        tgt_start = ref_start - offset
-        tgt_end = ref_end - offset
-        overlap = ref_end - ref_start
-        if overlap < min_overlap:
-            continue
-        c = pearson(env_ref[ref_start:ref_end], env_tgt[tgt_start:tgt_end])
-        if c > best_corr:
-            best_corr = c
-            best_offset_idx = offset
+    # Якщо один із сигналів плоский — кореляція безглузда
+    if std_a < 1e-6 or std_b < 1e-6:
+        return 0.0, 0.0
 
-    # Конвертуємо індекс субсемплів → секунди
-    offset_sec = best_offset_idx * subsample / sample_rate
-    return offset_sec, best_corr
+    a = [v / std_a for v in a]
+    b = [v / std_b for v in b]
+
+    # Pad до степені 2 >= n_ref + n_tgt - 1
+    n_fft = _next_pow2(n_ref + n_tgt - 1)
+    a_pad = [complex(v) for v in a] + [0j] * (n_fft - n_ref)
+    b_pad = [complex(v) for v in b] + [0j] * (n_fft - n_tgt)
+
+    # FFT cross-correlation: IFFT(FFT(a) * conj(FFT(b)))
+    A = _fft(a_pad)
+    B = _fft(b_pad)
+    C = [aa * bb.conjugate() for aa, bb in zip(A, B)]
+    corr = _ifft(C)
+
+    # Шукаємо пік (реальна частина)
+    corr_real = [c.real for c in corr]
+
+    best_val = -1e30
+    best_idx = 0
+    for i in range(len(corr_real)):
+        if corr_real[i] > best_val:
+            best_val = corr_real[i]
+            best_idx = i
+
+    # Нормалізуємо: ділимо на min(n_ref, n_tgt) для порівняння різних пар
+    strength = best_val / min(n_ref, n_tgt)
+
+    # Конвертуємо circular index → linear offset
+    if best_idx >= n_ref:
+        offset_idx = best_idx - n_fft  # від'ємний зсув
+    else:
+        offset_idx = best_idx
+
+    offset_sec = offset_idx * subsample / sample_rate
+    return offset_sec, strength
 
 
 # ─── XML ─────────────────────────────────────────────────────────────────────
@@ -550,17 +577,20 @@ class SyncApp:
                     audio = audio_data.get(clip['id'])
                     if audio is None:
                         return clip, []
+                    # Обчислюємо огинаючу повного аудіо
+                    env_full = compute_envelope(audio)
                     if is_ref:
-                        # Для рефу — повне аудіо файлу
-                        env = compute_envelope(audio)
+                        return clip, env_full
                     else:
-                        # Для цілі — тільки in..out фрагмент
-                        fragment = extract_fragment_audio(
-                            audio, clip['in'], clip['out'], self.timebase)
-                        if fragment is None:
+                        # Для цілі — вирізаємо з повної огинаючої (без крайових ефектів)
+                        in_sec = clip['in'] / self.timebase
+                        out_sec = clip['out'] / self.timebase
+                        in_env = int(in_sec * SAMPLE_RATE / SUBSAMPLE)
+                        out_env = int(out_sec * SAMPLE_RATE / SUBSAMPLE)
+                        env_slice = env_full[in_env:out_env]
+                        if len(env_slice) < 5:
                             return clip, []
-                        env = compute_envelope(fragment)
-                    return clip, env
+                        return clip, env_slice
 
                 env_data = {}
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -580,67 +610,79 @@ class SyncApp:
                 progress(f"Огинаючі: {ref_env_ok}/{len(ref_clips)} реф, "
                          f"{tgt_env_ok}/{len(tgt_clips)} ціль")
 
-                # ── Степ 4: крос-кореляція огинаючих — ковзне вікно ──
-                progress("Порівнюю огинаючі...")
-                synced = 0
-                unmatched = []
-                match_results = {}   # tgt_id → {ref_name, corr, offset_sec, ...}
-                search_start = 0
+                # ── Степ 4: FFT крос-кореляція — повний пошук + жадний матчинг ──
+                progress("FFT крос-кореляція (всі пари)...")
 
-                for i, tgt_clip in enumerate(tgt_clips):
+                # 4а. Обчислюємо ВСІ пари (ref_i, tgt_j) → (offset, strength)
+                all_pairs = []  # [(strength, ri, ti, offset_sec)]
+
+                for ti, tgt_clip in enumerate(tgt_clips):
                     env_tgt = env_data.get(tgt_clip['id'], [])
                     if len(env_tgt) < 5:
-                        unmatched.append(tgt_clip)
-                        progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"коротка огинаюча ({len(env_tgt)} точок) → в кінець")
                         continue
-
-                    best_corr = -2.0
-                    best_offset_sec = 0.0
-                    best_ref_name = ""
-                    best_ref_idx = search_start
-
-                    # Пошук: від search_start з вікном
-                    window_from = max(0, search_start - SEARCH_WINDOW)
-                    window_to = min(len(ref_clips), search_start + SEARCH_WINDOW + 1)
-
-                    # Якщо вікно занадто мале — шукаємо всюди
-                    if window_to - window_from < 3:
-                        window_from = 0
-                        window_to = len(ref_clips)
-
-                    for ri in range(window_from, window_to):
-                        ref_clip = ref_clips[ri]
+                    for ri, ref_clip in enumerate(ref_clips):
                         env_ref = env_data.get(ref_clip['id'], [])
                         if len(env_ref) < 5:
                             continue
+                        offset_sec, strength = fft_cross_correlate(
+                            env_ref, env_tgt)
+                        if strength >= MIN_CORR:
+                            all_pairs.append((strength, ri, ti, offset_sec))
+                    progress()
 
-                        offset_sec, corr = find_offset_envelope(env_ref, env_tgt)
-                        if corr > best_corr:
-                            best_corr = corr
-                            best_offset_sec = offset_sec
-                            best_ref_name = ref_clip.get('name', '?')
-                            best_ref_idx = ri
+                progress(f"Знайдено {len(all_pairs)} кандидатів (corr≥{MIN_CORR})")
 
-                    if best_corr < MIN_CORR:
+                # 4б. Жадний 1:1 матчинг: сортуємо за силою, призначаємо
+                all_pairs.sort(key=lambda x: x[0], reverse=True)
+
+                assigned_ref = set()   # ri → вже призначений
+                assigned_tgt = set()   # ti → вже призначений
+                match_results = {}     # tgt_id → {...}
+                assignments = []       # [(ri, ti, offset_sec, strength)]
+
+                # Прохід 1: строго 1:1
+                for strength, ri, ti, offset_sec in all_pairs:
+                    if ri in assigned_ref or ti in assigned_tgt:
+                        continue
+                    assigned_ref.add(ri)
+                    assigned_tgt.add(ti)
+                    assignments.append((ri, ti, offset_sec, strength))
+
+                # Прохід 2: дозволяємо повторні рефи для ненайдених таргетів
+                for strength, ri, ti, offset_sec in all_pairs:
+                    if ti in assigned_tgt:
+                        continue
+                    assigned_tgt.add(ti)
+                    assignments.append((ri, ti, offset_sec, strength))
+
+                progress(f"Призначено {len(assignments)} матчів")
+
+                # 4в. Застосовуємо зсуви
+                synced = 0
+                unmatched = []
+
+                for ti, tgt_clip in enumerate(tgt_clips):
+                    # Шукаємо призначення для цього таргета
+                    match = None
+                    for ri, mti, offset_sec, strength in assignments:
+                        if mti == ti:
+                            match = (ri, offset_sec, strength)
+                            break
+
+                    if match is None:
                         unmatched.append(tgt_clip)
-                        progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"без матчу (best corr={best_corr:.3f}) → в кінець")
                         match_results[tgt_clip['id']] = {
-                            'matched': False, 'best_corr': best_corr,
-                            'best_ref': best_ref_name}
+                            'matched': False, 'best_corr': 0.0,
+                            'best_ref': '—'}
+                        progress(f"  [{ti+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
+                                 f"без матчу → в кінець")
                         continue
 
-                    # Обчислюємо нову позицію
-                    # ref_clip починається на таймлайні: start=ref_start, in=ref_in
-                    # ref_file_start = початок файлу на таймлайні = start - in
-                    # offset_sec = на скільки (у секундах) tgt-огинаюча зсунута
-                    #   відносно початку ref-файлу
-                    # Нова позиція tgt на таймлайні = ref_file_start + offset_sec
-                    ref_clip = ref_clips[best_ref_idx]
+                    ri, offset_sec, strength = match
+                    ref_clip = ref_clips[ri]
                     ref_file_start_sec = (ref_clip['start'] - ref_clip['in']) / self.timebase
 
-                    new_start_sec = ref_file_start_sec + best_offset_sec
+                    new_start_sec = ref_file_start_sec + offset_sec
                     new_start_frame = int(round(new_start_sec * self.timebase))
 
                     old_start = tgt_clip['start']
@@ -649,16 +691,16 @@ class SyncApp:
                     set_clip_position(tgt_clip, new_start_frame, self.timebase,
                                       self.sequence)
                     synced += 1
-                    search_start = best_ref_idx
 
                     match_results[tgt_clip['id']] = {
-                        'matched': True, 'best_corr': best_corr,
-                        'best_ref': best_ref_name, 'offset_sec': best_offset_sec,
+                        'matched': True, 'best_corr': strength,
+                        'best_ref': ref_clip.get('name', '?'),
+                        'offset_sec': offset_sec,
                         'old_start': old_start, 'new_start': new_start_frame}
 
-                    progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
+                    progress(f"  [{ti+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
                              f"{old_start}→{new_start_frame} (Δ{delta:+d}) "
-                             f"матч={best_ref_name} corr={best_corr:.3f}")
+                             f"матч={ref_clip['name']} str={strength:.3f}")
 
                 # ── Степ 5: кліпи без матчу — в кінець ──
                 if unmatched:
@@ -713,14 +755,18 @@ class SyncApp:
                     avg = sum(env) / n
                     mx = max(env)
                     mn = min(env)
-                    # Мініатюра (перші max_points точок)
+                    # Мініатюра (відносно max)
                     step = max(1, n // max_points)
                     mini = [env[j] for j in range(0, n, step)][:max_points]
+                    if mx > 0:
+                        norm = [v / mx for v in mini]
+                    else:
+                        norm = [0.0] * len(mini)
                     bar = ''.join('█' if v > 0.7 else '▓' if v > 0.4
-                                  else '░' if v > 0.1 else ' ' for v in mini)
+                                  else '░' if v > 0.1 else ' ' for v in norm)
                     dur_sec = n * SUBSAMPLE / SAMPLE_RATE
                     return (f"{n} точок ({dur_sec:.1f}s), "
-                            f"avg={avg:.3f} min={mn:.3f} max={mx:.3f}\n"
+                            f"avg={avg:.1f} min={mn:.1f} max={mx:.1f}\n"
                             f"             |{bar}|")
 
                 # ── Референсна доріжка ──
@@ -788,7 +834,7 @@ class SyncApp:
                 f.write(f"  ENV_WINDOW = {ENV_WINDOW}\n")
                 f.write(f"  SUBSAMPLE = {SUBSAMPLE}\n")
                 f.write(f"  MIN_CORR = {MIN_CORR}\n")
-                f.write(f"  SEARCH_WINDOW = {SEARCH_WINDOW}\n")
+                f.write(f"  Алгоритм: FFT крос-кореляція + жадний 1:1 матчинг\n")
 
                 f.write(f"\n{'═' * 70}\n")
                 f.write(f"Файл: {debug_path}\n")
