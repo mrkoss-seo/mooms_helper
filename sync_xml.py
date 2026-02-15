@@ -438,6 +438,9 @@ class SyncApp:
                                     state=tk.DISABLED)
         self.btn_save.pack(side=tk.LEFT)
 
+        self.debug_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bf, text="Дебаг", variable=self.debug_var).pack(side=tk.RIGHT)
+
         lf = ttk.LabelFrame(m, text="Лог", padding=5)
         lf.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         self.log = tk.Text(lf, height=10, wrap=tk.WORD, state=tk.DISABLED, font=('Menlo', 10))
@@ -723,6 +726,12 @@ class SyncApp:
                                           self.sequence)
                         tail_pos += clip_len + 25
 
+                # ── Дебаг-файл ──
+                if self.debug_var.get():
+                    self._write_debug(
+                        ref_clips, tgt_clips, peaks_data, audio_data,
+                        synced, unmatched)
+
                 self.root.after(0, lambda: self._sync_done(
                     synced, len(unmatched)))
 
@@ -732,6 +741,119 @@ class SyncApp:
                 self.root.after(0, lambda: self._sync_failed(str(e)))
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _write_debug(self, ref_clips, tgt_clips, peaks_data, audio_data,
+                      synced_count, unmatched_clips):
+        """Записує детальний дебаг-файл поруч зі скриптом."""
+        import datetime
+        debug_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        try:
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                f.write(f"═══ ДЕБАГ СИНХРОНІЗАТОРА v{self.version} ═══\n")
+                f.write(f"Дата: {datetime.datetime.now().isoformat()}\n")
+                f.write(f"XML: {self.xml_path}\n")
+                f.write(f"Timebase: {self.timebase} fps\n")
+                f.write(f"Результат: синхронізовано {synced_count}, "
+                        f"без матчу {len(unmatched_clips)}\n")
+                f.write(f"\n{'─' * 70}\n")
+
+                # ── Референсна доріжка ──
+                f.write(f"\n▶ РЕФЕРЕНС ({len(ref_clips)} кліпів):\n")
+                for i, c in enumerate(ref_clips):
+                    audio = audio_data.get(c['id'])
+                    audio_len = len(audio) if audio else 0
+                    audio_dur = f"{audio_len / SAMPLE_RATE:.1f}s" if audio_len else "N/A"
+                    peaks = peaks_data.get(c['id'], [])
+                    fp = pathurl_to_filepath(c['pathurl']) if c['pathurl'] else 'N/A'
+
+                    f.write(f"\n  [{i}] {c['name']}\n")
+                    f.write(f"      ID: {c['id']}\n")
+                    f.write(f"      Файл: {fp}\n")
+                    f.write(f"      start={c['start']} end={c['end']} "
+                            f"in={c['in']} out={c['out']} "
+                            f"dur={c['duration']}\n")
+                    f.write(f"      Аудіо: {audio_dur} "
+                            f"({audio_len} семплів @ {SAMPLE_RATE}Hz)\n")
+                    f.write(f"      Піки ({len(peaks)}):")
+                    if peaks:
+                        f.write('\n')
+                        for pi, (t, intens) in enumerate(peaks):
+                            f.write(f"        пік[{pi}]: t={t:.3f}s "
+                                    f"інтенс={intens:.3f}\n")
+                        # Інтервали
+                        if len(peaks) >= 2:
+                            f.write(f"      Інтервали: ")
+                            intervals = []
+                            for pi in range(1, len(peaks)):
+                                dt = peaks[pi][0] - peaks[pi-1][0]
+                                intervals.append(f"{dt:.3f}s")
+                            f.write(", ".join(intervals) + "\n")
+                    else:
+                        f.write(" (немає)\n")
+
+                f.write(f"\n{'─' * 70}\n")
+
+                # ── Цільова доріжка ──
+                f.write(f"\n▶ ЦІЛЬ ({len(tgt_clips)} кліпів):\n")
+                unmatched_names = {c['name'] for c in unmatched_clips}
+                for i, c in enumerate(tgt_clips):
+                    audio = audio_data.get(c['id'])
+                    audio_len = len(audio) if audio else 0
+                    audio_dur = f"{audio_len / SAMPLE_RATE:.1f}s" if audio_len else "N/A"
+                    peaks = peaks_data.get(c['id'], [])
+                    fp = pathurl_to_filepath(c['pathurl']) if c['pathurl'] else 'N/A'
+                    status = "БЕЗ МАТЧУ" if c['name'] in unmatched_names else "OK"
+
+                    f.write(f"\n  [{i}] {c['name']} [{status}]\n")
+                    f.write(f"      ID: {c['id']}\n")
+                    f.write(f"      Файл: {fp}\n")
+                    f.write(f"      start={c['start']} end={c['end']} "
+                            f"in={c['in']} out={c['out']} "
+                            f"dur={c['duration']}\n")
+                    f.write(f"      Фрагмент: "
+                            f"{c['in']/self.timebase:.2f}s - "
+                            f"{c['out']/self.timebase:.2f}s "
+                            f"= {(c['out']-c['in'])/self.timebase:.2f}s\n")
+                    f.write(f"      Аудіо файлу: {audio_dur}\n")
+                    f.write(f"      Піки фрагмента ({len(peaks)}):")
+                    if peaks:
+                        f.write('\n')
+                        for pi, (t, intens) in enumerate(peaks):
+                            f.write(f"        пік[{pi}]: t={t:.3f}s "
+                                    f"інтенс={intens:.3f}\n")
+                        if len(peaks) >= 2:
+                            f.write(f"      Інтервали: ")
+                            intervals = []
+                            for pi in range(1, len(peaks)):
+                                dt = peaks[pi][0] - peaks[pi-1][0]
+                                intervals.append(f"{dt:.3f}s")
+                            f.write(", ".join(intervals) + "\n")
+                    else:
+                        f.write(" (немає)\n")
+
+                f.write(f"\n{'─' * 70}\n")
+
+                # ── Параметри алгоритму ──
+                f.write(f"\n▶ ПАРАМЕТРИ:\n")
+                f.write(f"  SAMPLE_RATE = {SAMPLE_RATE}\n")
+                f.write(f"  ENVELOPE_WINDOW = {ENVELOPE_WINDOW}\n")
+                f.write(f"  PEAK_MIN_DISTANCE = {PEAK_MIN_DISTANCE}\n")
+                f.write(f"  PEAK_THRESHOLD = {PEAK_THRESHOLD}\n")
+                f.write(f"  MIN_PEAKS = {MIN_PEAKS}\n")
+                f.write(f"  INTERVAL_TOLERANCE = {INTERVAL_TOLERANCE}\n")
+                f.write(f"  INTENSITY_TOLERANCE = {INTENSITY_TOLERANCE}\n")
+                f.write(f"  MIN_MATCH_RATIO = {MIN_MATCH_RATIO}\n")
+                f.write(f"  SEARCH_WINDOW = {SEARCH_WINDOW}\n")
+
+                f.write(f"\n{'═' * 70}\n")
+                f.write(f"Файл: {debug_path}\n")
+
+            self.root.after(0, lambda: self._log(
+                f"Дебаг записано: {os.path.basename(debug_path)}"))
+        except Exception as e:
+            self.root.after(0, lambda: self._log(f"Помилка дебагу: {e}"))
 
     def _sync_done(self, synced, unmatched):
         self.progress['value'] = 100
