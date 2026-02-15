@@ -101,54 +101,7 @@ fi
 
 echo "Python: $PY"
 
-# ─── Шукаємо існуючий venv ───────────────────────────────────────────────────
-VENV=""
-for venv_candidate in \
-    "$HOME/.sync_xml_venv" \
-    "$APPDIR/.venv" \
-    "$APPDIR/venv" \
-    "$APPDIR/.sync_xml_venv"; do
-
-    if [ -f "$venv_candidate/bin/python3" ]; then
-        if "$venv_candidate/bin/python3" -c "import numpy; import scipy" 2>/dev/null; then
-            VENV="$venv_candidate"
-            echo "Знайдено існуючий venv: $VENV"
-            break
-        fi
-    fi
-done
-
-# Якщо не знайшли готовий — створюємо у домашній папці
-if [ -z "$VENV" ]; then
-    VENV="$HOME/.sync_xml_venv"
-
-    if [ ! -f "$VENV/bin/python3" ]; then
-        echo "Створюю віртуальне оточення..."
-        $PY -m venv "$VENV"
-        if [ $? -ne 0 ]; then
-            echo "Не вдалося створити venv!"
-            read -p "Натисніть Enter для закриття..."
-            exit 1
-        fi
-    fi
-fi
-
-# Тепер працюємо через venv Python
-VPY="$VENV/bin/python3"
-
-# Встановлюємо залежності якщо потрібно
-if ! $VPY -c "import numpy; import scipy" 2>/dev/null; then
-    echo "Встановлюю бібліотеки (numpy, scipy)..."
-    $VPY -m pip install --upgrade pip 2>/dev/null
-    $VPY -m pip install numpy scipy
-    if [ $? -ne 0 ]; then
-        echo "Помилка встановлення бібліотек!"
-        read -p "Натисніть Enter для закриття..."
-        exit 1
-    fi
-fi
-
-# Перевірка ffmpeg
+# ─── Перевірка ffmpeg ─────────────────────────────────────────────────────────
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 if ! command -v ffmpeg &>/dev/null; then
     echo "ffmpeg не знайдено!"
@@ -158,8 +111,9 @@ if ! command -v ffmpeg &>/dev/null; then
     exit 1
 fi
 
-# Запускаємо GUI у фоні і закриваємо термінал
-nohup $VPY sync_xml.py &>/dev/null &
+# ─── Запуск (v5: без venv, без numpy/scipy!) ─────────────────────────────────
+echo "Запускаю синхронізатор..."
+nohup $PY "$APPDIR/sync_xml.py" &>/dev/null &
 disown
 
 osascript -e 'tell application "Terminal" to close front window' &>/dev/null &

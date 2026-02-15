@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Синхронізатор XML для Adobe Premiere Pro — v4.
+Синхронізатор XML для Adobe Premiere Pro — v5.
 
-Алгоритм:
+Алгоритм на основі аудіо-всплесків (peak fingerprinting):
 1. Референс = доріжка з більшою кількістю кліпів
 2. Сортуємо обидві доріжки хронологічно (по імені файлу)
-3. Витягуємо аудіо, обчислюємо MFCC
-4. Ковзне вікно: для кожного кліпу cam2 шукаємо матч серед кліпів cam1,
-   починаючи від позиції попереднього матчу (не з початку)
-5. Матч з score >= 9 → ставимо на обчислену позицію
-6. Без матчу → ставимо в кінець таймлайну (мама вирішить)
+3. Витягуємо аудіо (ffmpeg → WAV), знаходимо всплески (піки гучності)
+4. Відбиток кліпу = список (час_піку, інтенсивність)
+5. Для кожного кліпу cam2 шукаємо матч серед кліпів cam1:
+   порівнюємо інтервали між піками + їх інтенсивність
+6. Матч ≥ 60% → ставимо на обчислену позицію
+7. Без матчу → ставимо в кінець таймлайну
 
-MFCC-кореляція натхненна BBC audio-offset-finder (Apache 2.0).
+Без numpy/scipy — чистий Python + ffmpeg.
 """
 
 import tkinter as tk
@@ -24,33 +25,28 @@ import re
 import threading
 import wave
 import struct
+import math
 from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-try:
-    import numpy as np
-    from scipy.fft import dct
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
 
+# ─── Параметри ───────────────────────────────────────────────────────────────
 
-# ─── Параметри MFCC ──────────────────────────────────────────────────────────
-
-SAMPLE_RATE = 8000
-HOP_LENGTH = 128
-WIN_LENGTH = 256
-NFFT = 512
-N_MFCC = 26
-N_MELS = 40
-MIN_SCORE = 9       # мінімальний standard score для матчу
-WINDOW_MARGIN = 5   # ковзне вікно: скільки кліпів назад дозволяємо
+SAMPLE_RATE = 8000       # для піків достатньо
+ENVELOPE_WINDOW = 800    # вікно огинаючої (~100мс при 8000Hz)
+PEAK_MIN_DISTANCE = 2400 # мін. відстань між піками (~300мс)
+PEAK_THRESHOLD = 0.3     # поріг від максимуму огинаючої
+MIN_PEAKS = 3            # мінімум піків для порівняння
+INTERVAL_TOLERANCE = 0.05  # 50мс допуск для інтервалів
+INTENSITY_TOLERANCE = 0.25 # 25% допуск для інтенсивності
+MIN_MATCH_RATIO = 0.60   # мінімум 60% співпадінь
+SEARCH_WINDOW = 10       # скільки рефів перевіряємо навколо search_start
 
 
 # ─── Аудіо ───────────────────────────────────────────────────────────────────
 
 def extract_audio(video_path, sample_rate=SAMPLE_RATE):
-    """Витягує аудіо з файлу через ffmpeg → numpy array або None."""
+    """Витягує аудіо з файлу через ffmpeg → список int16 або None."""
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -65,7 +61,7 @@ def extract_audio(video_path, sample_rate=SAMPLE_RATE):
             if n == 0:
                 return None
             raw = wf.readframes(n)
-            return np.array(struct.unpack(f'<{n}h', raw), dtype=np.float64)
+            return list(struct.unpack(f'<{n}h', raw))
     except Exception:
         return None
     finally:
@@ -76,166 +72,160 @@ def extract_audio(video_path, sample_rate=SAMPLE_RATE):
 def get_file_sort_key(clip):
     """Ключ сортування: витягуємо числову частину з імені файлу (без розширення)."""
     name = clip.get('name', '')
-    # Прибираємо розширення: P1013312.MP4 → P1013312
     base = os.path.splitext(name)[0]
-    # P1013312 → 1013312
     nums = re.findall(r'\d+', base)
     if nums:
         return int(nums[-1])
     return name
 
 
-# ─── MFCC без librosa ────────────────────────────────────────────────────────
+# ─── Піки (всплески) ─────────────────────────────────────────────────────────
 
-def hz_to_mel(hz):
-    return 2595.0 * np.log10(1.0 + hz / 700.0)
-
-def mel_to_hz(mel):
-    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
-
-def mel_filterbank(n_mels, nfft, sr):
-    low_mel = hz_to_mel(0)
-    high_mel = hz_to_mel(sr / 2)
-    mel_points = np.linspace(low_mel, high_mel, n_mels + 2)
-    hz_points = mel_to_hz(mel_points)
-    bins = np.floor((nfft + 1) * hz_points / sr).astype(int)
-    fb = np.zeros((n_mels, nfft // 2 + 1))
-    for i in range(n_mels):
-        left, center, right = bins[i], bins[i+1], bins[i+2]
-        for j in range(left, center):
-            if center > left:
-                fb[i, j] = (j - left) / (center - left)
-        for j in range(center, right):
-            if right > center:
-                fb[i, j] = (right - j) / (right - center)
-    return fb
-
-_mel_fb_cache = {}
-
-def compute_mfcc(audio, sr=SAMPLE_RATE, n_mfcc=N_MFCC, n_mels=N_MELS,
-                 nfft=NFFT, win_length=WIN_LENGTH, hop_length=HOP_LENGTH):
-    """MFCC без librosa. Повертає (n_frames, n_mfcc)."""
-    window = np.hanning(win_length)
-    n_frames = 1 + (len(audio) - win_length) // hop_length
-    if n_frames < 1:
-        return np.array([]).reshape(0, n_mfcc)
-
-    frames = np.zeros((n_frames, nfft))
-    for i in range(n_frames):
-        start = i * hop_length
-        frame = audio[start:start + win_length] * window
-        frames[i, :win_length] = frame
-
-    spectrum = np.abs(np.fft.rfft(frames, n=nfft)) ** 2
-
-    key = (n_mels, nfft, sr)
-    if key not in _mel_fb_cache:
-        _mel_fb_cache[key] = mel_filterbank(n_mels, nfft, sr)
-    fb = _mel_fb_cache[key]
-
-    mel_spec = np.dot(spectrum, fb.T)
-    mel_spec = np.log(mel_spec + 1e-10)
-    mfcc = dct(mel_spec, type=2, axis=1, norm='ortho')[:, :n_mfcc]
-    return mfcc
+def compute_envelope(audio, window=ENVELOPE_WINDOW):
+    """Огинаюча = ковзне середнє від |сигналу|. Повертає список float."""
+    n = len(audio)
+    if n < window:
+        return [0.0] * n
+    abs_audio = [abs(s) for s in audio]
+    half_w = window // 2
+    # Кумулятивна сума для швидкого обчислення
+    cumsum = [0.0] * (n + 1)
+    for i in range(n):
+        cumsum[i + 1] = cumsum[i] + abs_audio[i]
+    env = [0.0] * n
+    for i in range(n):
+        lo = max(0, i - half_w)
+        hi = min(n, i + half_w + 1)
+        env[i] = (cumsum[hi] - cumsum[lo]) / (hi - lo)
+    return env
 
 
-def std_mfcc(mfcc_array):
-    """Z-score нормалізація (як у BBC audio-offset-finder)."""
-    std = np.std(mfcc_array, axis=0)
-    std[std < 1e-10] = 1.0
-    return (mfcc_array - np.mean(mfcc_array, axis=0)) / std
-
-
-# ─── Крос-кореляція MFCC ─────────────────────────────────────────────────────
-
-def cross_correlation_mfcc(mfcc1, mfcc2, nframes):
-    """Крос-кореляція (натхнення: BBC audio-offset-finder, Apache 2.0)."""
-    n1 = mfcc1.shape[0]
-    n2 = mfcc2.shape[0]
-    o_min = nframes - n2
-    o_max = n1 - nframes + 1
-    n = o_max - o_min
-    c = np.zeros(n)
-    for k in range(o_min, 0):
-        cc = np.sum(np.multiply(mfcc1[:nframes], mfcc2[-k:nframes - k]), axis=0)
-        c[k - o_min] = np.linalg.norm(cc)
-    for k in range(0, o_max):
-        cc = np.sum(np.multiply(mfcc1[k:k + nframes], mfcc2[:nframes]), axis=0)
-        c[k - o_min] = np.linalg.norm(cc)
-    return c, o_min, o_max
-
-
-def find_offset_mfcc(mfcc1, mfcc2, max_frames=2000):
-    """Зсув mfcc2 відносно mfcc1. Повертає (frame_offset, standard_score)."""
-    correl_nframes = min(int(len(mfcc1) / 3), len(mfcc2), max_frames)
-    if correl_nframes < 5:
-        return 0, 0.0
-    c, o_min, o_max = cross_correlation_mfcc(mfcc1, mfcc2, correl_nframes)
-    max_idx = np.argmax(c)
-    frame_offset = max_idx + o_min
-    std_c = np.std(c)
-    if std_c < 1e-10:
-        return 0, 0.0
-    score = (c[max_idx] - np.mean(c)) / std_c
-    return frame_offset, score
-
-
-def match_clip_in_window(tgt_clip, ref_clips, search_start, timebase,
-                         sample_rate=SAMPLE_RATE):
+def find_peaks(audio, sample_rate=SAMPLE_RATE,
+               envelope_window=ENVELOPE_WINDOW,
+               min_distance=PEAK_MIN_DISTANCE,
+               threshold_ratio=PEAK_THRESHOLD):
     """
-    Шукає матч для tgt_clip серед ref_clips[search_start:].
-    Ковзне вікно: не шукаємо раніше search_start.
-
-    Повертає (new_start_frame, score, ref_name, matched_ref_index) або None.
+    Знаходить всплески в аудіо.
+    Повертає список (час_сек, інтенсивність_нормалізована).
     """
-    tgt_audio = tgt_clip.get('_audio')
-    if tgt_audio is None:
-        return None
+    if len(audio) < envelope_window * 2:
+        return []
 
-    in_sec = tgt_clip['in'] / timebase
-    out_sec = tgt_clip['out'] / timebase
-    in_sample = int(in_sec * sample_rate)
-    out_sample = min(int(out_sec * sample_rate), len(tgt_audio))
-    tgt_fragment = tgt_audio[in_sample:out_sample]
+    env = compute_envelope(audio, envelope_window)
+    max_env = max(env) if env else 0.0
+    if max_env < 100:  # тиша
+        return []
 
-    if len(tgt_fragment) < sample_rate * 0.5:
-        return None
+    threshold = max_env * threshold_ratio
+    peaks = []
+    last_peak_pos = -min_distance * 2  # щоб перший пік завжди пройшов
 
-    tgt_mfcc = compute_mfcc(tgt_fragment, sr=sample_rate)
-    if len(tgt_mfcc) < 5:
-        return None
-    tgt_mfcc = std_mfcc(tgt_mfcc)
-
-    best_score = -1
-    best_start = 0
-    best_ref_name = ""
-    best_ref_idx = search_start
-
-    # Шукаємо від search_start (з невеликим запасом назад)
-    window_from = max(0, search_start - WINDOW_MARGIN)
-
-    for ref_idx in range(window_from, len(ref_clips)):
-        ref_clip = ref_clips[ref_idx]
-        ref_mfcc = ref_clip.get('_mfcc')
-        if ref_mfcc is None:
+    # Шукаємо локальні максимуми вище порогу
+    for i in range(1, len(env) - 1):
+        if env[i] < threshold:
             continue
+        if i - last_peak_pos < min_distance:
+            # Якщо цей пік вищий за попередній у вікні — замінюємо
+            if peaks and env[i] > peaks[-1][1] * max_env:
+                peaks[-1] = (i / sample_rate, env[i] / max_env)
+                last_peak_pos = i
+            continue
+        # Локальний максимум (вище сусідів)
+        if env[i] >= env[i - 1] and env[i] >= env[i + 1]:
+            peaks.append((i / sample_rate, env[i] / max_env))
+            last_peak_pos = i
 
-        frame_offset, score = find_offset_mfcc(ref_mfcc, tgt_mfcc)
+    return peaks
 
-        if score > best_score:
-            best_score = score
-            offset_sec = frame_offset * HOP_LENGTH / sample_rate
-            ref_file_start_sec = (ref_clip['start'] - ref_clip['in']) / timebase
-            tgt_timeline_sec = ref_file_start_sec + offset_sec
-            new_start_frame = int(round(tgt_timeline_sec * timebase))
-            best_start = new_start_frame
-            best_ref_name = ref_clip.get('name', '?')
-            best_ref_idx = ref_idx
 
-    if best_score < MIN_SCORE:
+def extract_fragment_audio(audio, in_frame, out_frame, timebase, sample_rate=SAMPLE_RATE):
+    """Вирізає фрагмент аудіо за in/out фреймами таймлайну."""
+    in_sec = in_frame / timebase
+    out_sec = out_frame / timebase
+    in_sample = int(in_sec * sample_rate)
+    out_sample = min(int(out_sec * sample_rate), len(audio))
+    if out_sample - in_sample < sample_rate * 0.5:
+        return None
+    return audio[in_sample:out_sample]
+
+
+# ─── Порівняння відбитків ─────────────────────────────────────────────────────
+
+def compute_intervals(peaks):
+    """Інтервали між сусідніми піками + їх інтенсивність."""
+    intervals = []
+    for i in range(1, len(peaks)):
+        dt = peaks[i][0] - peaks[i - 1][0]
+        intensity = (peaks[i - 1][1] + peaks[i][1]) / 2.0
+        intervals.append((dt, intensity))
+    return intervals
+
+
+def match_peaks(peaks_ref, peaks_tgt,
+                interval_tol=INTERVAL_TOLERANCE,
+                intensity_tol=INTENSITY_TOLERANCE,
+                min_ratio=MIN_MATCH_RATIO):
+    """
+    Порівнює піки двох кліпів методом ковзного вікна.
+
+    Для кожного можливого зсуву перевіряємо:
+    - чи збігаються інтервали між піками (±50мс)
+    - чи збігаються інтенсивності (±25%)
+
+    Повертає (offset_sec, match_ratio, matched_count) або None.
+    Offset = на скільки секунд tgt зсунути щоб він збігся з ref.
+    """
+    if len(peaks_ref) < MIN_PEAKS or len(peaks_tgt) < MIN_PEAKS:
         return None
 
-    return best_start, best_score, best_ref_name, best_ref_idx
+    best_offset = 0.0
+    best_ratio = 0.0
+    best_matched = 0
+
+    # Пробуємо всі можливі зіставлення першого піку tgt з кожним піком ref
+    for ri in range(len(peaks_ref)):
+        # Зсув = ref_peak_time - tgt_peak_time
+        offset = peaks_ref[ri][0] - peaks_tgt[0][0]
+
+        matched = 0
+        total_compared = 0
+
+        for ti in range(len(peaks_tgt)):
+            tgt_time = peaks_tgt[ti][0] + offset
+            tgt_intensity = peaks_tgt[ti][1]
+
+            # Шукаємо найближчий пік у ref
+            best_dist = float('inf')
+            best_ri_match = -1
+            for rj in range(len(peaks_ref)):
+                dist = abs(peaks_ref[rj][0] - tgt_time)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_ri_match = rj
+
+            total_compared += 1
+
+            if best_dist <= interval_tol and best_ri_match >= 0:
+                # Перевіряємо інтенсивність
+                ref_intensity = peaks_ref[best_ri_match][1]
+                if ref_intensity > 0:
+                    intensity_diff = abs(tgt_intensity - ref_intensity) / ref_intensity
+                else:
+                    intensity_diff = abs(tgt_intensity - ref_intensity)
+                if intensity_diff <= intensity_tol:
+                    matched += 1
+
+        if total_compared > 0:
+            ratio = matched / total_compared
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_offset = offset
+                best_matched = matched
+
+    if best_ratio < min_ratio or best_matched < MIN_PEAKS:
+        return None
+
+    return best_offset, best_ratio, best_matched
 
 
 # ─── XML ─────────────────────────────────────────────────────────────────────
@@ -318,8 +308,6 @@ def parse_xmeml(xml_path):
                 'duration': int(dur_el.text) if dur_el is not None else 0,
                 'pathurl': pathurl,
                 'links': links,
-                '_audio': None,
-                '_mfcc': None,
             })
 
         track_info.append({'element': track, 'index': i, 'clips': clips})
@@ -376,37 +364,6 @@ def set_clip_position(clip, new_start, timebase, sequence):
                     as_el.text = str(new_start)
                 if ae_el is not None:
                     ae_el.text = str(new_end)
-                break
-
-
-def remove_clip_from_track(clip, sequence):
-    """Видаляє кліп з відео- та аудіо-доріжок."""
-    el = clip['element']
-    parent = None
-    # Знаходимо батьківський track
-    for track in sequence.find('./media/video').findall('track'):
-        if el in list(track):
-            parent = track
-            break
-    if parent is not None:
-        parent.remove(el)
-
-    # Видаляємо пов'язані аудіо
-    audio_section = sequence.find('./media/audio')
-    if audio_section is None:
-        return
-    audio_tracks = audio_section.findall('track')
-
-    for link in clip['links']:
-        if link['mediatype'] != 'audio':
-            continue
-        clipref = link['clipref']
-        tidx = link['trackindex'] - 1
-        if tidx < 0 or tidx >= len(audio_tracks):
-            continue
-        for aci in list(audio_tracks[tidx]):
-            if aci.get('id') == clipref:
-                audio_tracks[tidx].remove(aci)
                 break
 
 
@@ -489,7 +446,6 @@ class SyncApp:
         self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # ── Версія внизу ──
         ver_frame = ttk.Frame(m)
         ver_frame.pack(fill=tk.X, pady=(3, 0))
         ttk.Label(ver_frame, text=f"v{self.version}",
@@ -540,7 +496,6 @@ class SyncApp:
         self.ref_combo['values'] = opts
         self.tgt_combo['values'] = opts
         if len(opts) >= 2:
-            # Автовибір: більше кліпів = референс
             vt_sorted = sorted(enumerate(vt), key=lambda x: len(x[1]['clips']), reverse=True)
             self.ref_combo.current(vt_sorted[0][0])
             self.tgt_combo.current(vt_sorted[1][0])
@@ -550,9 +505,6 @@ class SyncApp:
         self._log(f"Відкрито: {os.path.basename(path)}")
 
     def start_sync(self):
-        if not HAS_SCIPY:
-            messagebox.showerror("Помилка", "numpy/scipy не встановлені")
-            return
         try:
             subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -583,8 +535,9 @@ class SyncApp:
         def run():
             try:
                 n_workers = max(2, os.cpu_count() or 4)
+                import threading as _thr
 
-                # ── Степ 1-2: сортуємо хронологічно ──
+                # ── Степ 1: сортуємо хронологічно ──
                 ref_clips.sort(key=get_file_sort_key)
                 tgt_clips.sort(key=get_file_sort_key)
 
@@ -594,16 +547,10 @@ class SyncApp:
                 self.root.after(0, lambda: self._log(
                     f"Ціль: {len(tgt_clips)} кліпів "
                     f"({tgt_clips[0]['name']}...{tgt_clips[-1]['name']})"))
-                self.root.after(0, lambda: self._log(
-                    f"Потоки: {n_workers}"))
 
                 all_clips = ref_clips + tgt_clips
-                # аудіо + mfcc(all) + матчі(tgt*ref) + вікно + фіналізація
-                total_steps = (len(all_clips) + len(all_clips)
-                               + len(tgt_clips) * len(ref_clips)
-                               + len(tgt_clips) + 3)
+                total_steps = len(all_clips) + len(all_clips) + len(tgt_clips) + 3
                 step = [0]
-                import threading as _thr
                 step_lock = _thr.Lock()
 
                 def progress(msg=None):
@@ -614,7 +561,7 @@ class SyncApp:
                     if msg:
                         self.root.after(0, lambda m=msg: self._log(m))
 
-                # ── Степ 3: витягуємо аудіо (паралельно, ffmpeg) ──
+                # ── Степ 2: витягуємо аудіо (паралельно) ──
                 progress("Витягую аудіо...")
                 path_cache = {}
                 cache_lock = _thr.Lock()
@@ -633,148 +580,138 @@ class SyncApp:
                         path_cache[fp] = audio
                     return clip, audio
 
+                audio_data = {}
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
                     futures = {pool.submit(get_audio, c): c for c in all_clips}
                     for future in as_completed(futures):
                         clip, audio = future.result()
-                        clip['_audio'] = audio
+                        audio_data[clip['id']] = audio
                         progress()
 
-                ref_ok = sum(1 for c in ref_clips if c['_audio'] is not None)
-                tgt_ok = sum(1 for c in tgt_clips if c['_audio'] is not None)
+                ref_ok = sum(1 for c in ref_clips if audio_data.get(c['id']) is not None)
+                tgt_ok = sum(1 for c in tgt_clips if audio_data.get(c['id']) is not None)
                 progress(f"Аудіо: {ref_ok}/{len(ref_clips)} реф, {tgt_ok}/{len(tgt_clips)} ціль")
 
                 if ref_ok == 0 or tgt_ok == 0:
                     raise RuntimeError("Не вдалося витягнути аудіо з файлів")
 
-                # ── Степ 4: MFCC для ВСІХ кліпів (паралельно) ──
-                progress("MFCC (паралельно)...")
+                # ── Степ 3: знаходимо піки для всіх кліпів (паралельно) ──
+                progress("Шукаю піки...")
 
-                def compute_clip_mfcc(clip, is_ref):
-                    """Обчислює MFCC для кліпу. Для ref — повне аудіо,
-                    для tgt — тільки in..out фрагмент."""
-                    audio = clip.get('_audio')
+                def get_peaks_for_clip(clip, is_ref):
+                    audio = audio_data.get(clip['id'])
                     if audio is None:
-                        return clip, None
+                        return clip, []
                     if is_ref:
-                        fragment = audio
+                        # Для рефу — повне аудіо
+                        peaks = find_peaks(audio)
                     else:
-                        in_sec = clip['in'] / self.timebase
-                        out_sec = clip['out'] / self.timebase
-                        in_sample = int(in_sec * SAMPLE_RATE)
-                        out_sample = min(int(out_sec * SAMPLE_RATE), len(audio))
-                        fragment = audio[in_sample:out_sample]
-                        if len(fragment) < SAMPLE_RATE * 0.5:
-                            return clip, None
-                    mfcc = compute_mfcc(fragment, sr=SAMPLE_RATE)
-                    if len(mfcc) < 5:
-                        return clip, None
-                    return clip, std_mfcc(mfcc)
+                        # Для цілі — тільки in..out
+                        fragment = extract_fragment_audio(
+                            audio, clip['in'], clip['out'], self.timebase)
+                        if fragment is None:
+                            return clip, []
+                        peaks = find_peaks(fragment)
+                    return clip, peaks
 
+                peaks_data = {}
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    # Ref кліпи — повне аудіо
-                    ref_futures = {pool.submit(compute_clip_mfcc, c, True): c
-                                   for c in ref_clips}
-                    # Tgt кліпи — in..out фрагмент
-                    tgt_futures = {pool.submit(compute_clip_mfcc, c, False): c
-                                   for c in tgt_clips}
-
-                    for future in as_completed(list(ref_futures) + list(tgt_futures)):
-                        clip, mfcc = future.result()
-                        clip['_mfcc'] = mfcc
+                    ref_futures = [pool.submit(get_peaks_for_clip, c, True)
+                                   for c in ref_clips]
+                    tgt_futures = [pool.submit(get_peaks_for_clip, c, False)
+                                   for c in tgt_clips]
+                    for future in as_completed(ref_futures + tgt_futures):
+                        clip, peaks = future.result()
+                        peaks_data[clip['id']] = peaks
                         progress()
 
-                ref_mfcc_ok = sum(1 for c in ref_clips if c['_mfcc'] is not None)
-                tgt_mfcc_ok = sum(1 for c in tgt_clips if c['_mfcc'] is not None)
-                progress(f"MFCC: {ref_mfcc_ok}/{len(ref_clips)} реф, "
-                         f"{tgt_mfcc_ok}/{len(tgt_clips)} ціль")
+                ref_peaks_ok = sum(1 for c in ref_clips
+                                   if len(peaks_data.get(c['id'], [])) >= MIN_PEAKS)
+                tgt_peaks_ok = sum(1 for c in tgt_clips
+                                   if len(peaks_data.get(c['id'], [])) >= MIN_PEAKS)
+                progress(f"Піки: {ref_peaks_ok}/{len(ref_clips)} реф (≥{MIN_PEAKS}), "
+                         f"{tgt_peaks_ok}/{len(tgt_clips)} ціль")
 
-                # ── Степ 5: попарна кореляція (паралельно) ──
-                # Для кожного tgt[i] × ref[j] знаходимо (offset, score)
-                progress("Попарна кореляція (паралельно)...")
-
-                # match_matrix[i][j] = (new_start_frame, score) або None
-                match_matrix = [[None] * len(ref_clips)
-                                for _ in range(len(tgt_clips))]
-
-                def compute_pair(ti, ri):
-                    """Кореляція tgt[ti] з ref[ri]. Повертає (ti, ri, result)."""
-                    tgt_mfcc = tgt_clips[ti].get('_mfcc')
-                    ref_mfcc = ref_clips[ri].get('_mfcc')
-                    if tgt_mfcc is None or ref_mfcc is None:
-                        return ti, ri, None
-
-                    frame_offset, score = find_offset_mfcc(ref_mfcc, tgt_mfcc)
-                    if score < MIN_SCORE:
-                        return ti, ri, None
-
-                    offset_sec = frame_offset * HOP_LENGTH / SAMPLE_RATE
-                    ref_clip = ref_clips[ri]
-                    ref_file_start_sec = (ref_clip['start'] - ref_clip['in']) / self.timebase
-                    tgt_timeline_sec = ref_file_start_sec + offset_sec
-                    new_start_frame = int(round(tgt_timeline_sec * self.timebase))
-                    return ti, ri, (new_start_frame, score)
-
-                pairs = [(ti, ri) for ti in range(len(tgt_clips))
-                         for ri in range(len(ref_clips))]
-
-                with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    futures = [pool.submit(compute_pair, ti, ri) for ti, ri in pairs]
-                    for future in as_completed(futures):
-                        ti, ri, result = future.result()
-                        match_matrix[ti][ri] = result
-                        progress()
-
-                # ── Степ 6: ковзне вікно (миттєво — дані вже готові) ──
-                progress("Ковзне вікно: вибір найкращих матчів...")
+                # ── Степ 4: порівнюємо піки — ковзне вікно ──
+                progress("Порівнюю відбитки...")
                 synced = 0
                 unmatched = []
                 search_start = 0
 
                 for i, tgt_clip in enumerate(tgt_clips):
-                    window_from = max(0, search_start - WINDOW_MARGIN)
-                    best_score = -1
-                    best_start = 0
+                    tgt_peaks = peaks_data.get(tgt_clip['id'], [])
+                    if len(tgt_peaks) < MIN_PEAKS:
+                        unmatched.append(tgt_clip)
+                        progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
+                                 f"мало піків ({len(tgt_peaks)}) → в кінець")
+                        continue
+
+                    best_ratio = 0.0
+                    best_offset_sec = 0.0
                     best_ref_name = ""
                     best_ref_idx = search_start
+                    best_matched = 0
 
-                    for ri in range(window_from, len(ref_clips)):
-                        result = match_matrix[i][ri]
+                    # Пошук: від search_start з вікном
+                    window_from = max(0, search_start - SEARCH_WINDOW)
+                    window_to = min(len(ref_clips), search_start + SEARCH_WINDOW + 1)
+
+                    # Якщо вікно занадто мале — шукаємо всюди
+                    if window_to - window_from < 3:
+                        window_from = 0
+                        window_to = len(ref_clips)
+
+                    for ri in range(window_from, window_to):
+                        ref_clip = ref_clips[ri]
+                        ref_peaks = peaks_data.get(ref_clip['id'], [])
+                        if len(ref_peaks) < MIN_PEAKS:
+                            continue
+
+                        result = match_peaks(ref_peaks, tgt_peaks)
                         if result is None:
                             continue
-                        new_start, score = result
-                        if score > best_score:
-                            best_score = score
-                            best_start = new_start
-                            best_ref_name = ref_clips[ri].get('name', '?')
+
+                        offset_sec, ratio, matched = result
+                        if ratio > best_ratio or (ratio == best_ratio and matched > best_matched):
+                            best_ratio = ratio
+                            best_offset_sec = offset_sec
+                            best_ref_name = ref_clip.get('name', '?')
                             best_ref_idx = ri
+                            best_matched = matched
 
-                    if best_score < MIN_SCORE:
+                    if best_ratio < MIN_MATCH_RATIO or best_matched < MIN_PEAKS:
                         unmatched.append(tgt_clip)
                         progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"без матчу → в кінець")
+                                 f"без матчу (best {best_ratio:.0%}) → в кінець")
                         continue
 
-                    # М'яка перевірка
-                    if best_start < -50000:
-                        unmatched.append(tgt_clip)
-                        progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"аномальна позиція ({best_start}) → в кінець")
-                        continue
+                    # Обчислюємо нову позицію
+                    # ref_clip починається на таймлайні = ref_start
+                    # ref_audio[0] = файл[0]
+                    # offset_sec = на скільки зсунути tgt щоб збігся з ref
+                    # tgt_in_sec = in / timebase (початок фрагмента у файлі)
+                    # new_start_sec = ref_file_start_sec + offset_sec + tgt_in_sec
+                    ref_clip = ref_clips[best_ref_idx]
+                    ref_file_start_sec = (ref_clip['start'] - ref_clip['in']) / self.timebase
+
+                    tgt_in_sec = tgt_clip['in'] / self.timebase
+                    new_start_sec = ref_file_start_sec + best_offset_sec
+                    new_start_frame = int(round(new_start_sec * self.timebase))
 
                     old_start = tgt_clip['start']
-                    delta = best_start - old_start
+                    delta = new_start_frame - old_start
 
-                    set_clip_position(tgt_clip, best_start, self.timebase,
+                    set_clip_position(tgt_clip, new_start_frame, self.timebase,
                                       self.sequence)
                     synced += 1
                     search_start = best_ref_idx
 
                     progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                             f"{old_start}→{best_start} (Δ{delta:+d}) "
-                             f"матч={best_ref_name} score={best_score:.1f}")
+                             f"{old_start}→{new_start_frame} (Δ{delta:+d}) "
+                             f"матч={best_ref_name} {best_ratio:.0%} "
+                             f"({best_matched} піків)")
 
-                # ── Степ 7: кліпи без матчу — ставимо в кінець ──
+                # ── Степ 5: кліпи без матчу — в кінець ──
                 if unmatched:
                     ref_max_end = max(c['end'] for c in ref_clips)
                     progress(f"Ставлю {len(unmatched)} кліпів без матчу в кінець...")
