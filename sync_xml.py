@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Синхронізатор XML для Adobe Premiere Pro — v5.
+Синхронізатор XML для Adobe Premiere Pro — v6.
 
-Алгоритм на основі аудіо-всплесків (peak fingerprinting):
+Алгоритм: envelope cross-correlation (крос-кореляція огинаючої).
 1. Референс = доріжка з більшою кількістю кліпів
-2. Сортуємо обидві доріжки хронологічно (по імені файлу)
-3. Витягуємо аудіо (ffmpeg → WAV), знаходимо всплески (піки гучності)
-4. Відбиток кліпу = список (час_піку, інтенсивність)
-5. Для кожного кліпу cam2 шукаємо матч серед кліпів cam1:
-   порівнюємо інтервали між піками + їх інтенсивність
-6. Матч ≥ 60% → ставимо на обчислену позицію
-7. Без матчу → ставимо в кінець таймлайну
+2. Сортуємо обидві доріжки хронологічно
+3. Витягуємо аудіо (ffmpeg → WAV)
+4. Обчислюємо огинаючу (форму гучності) + нормалізуємо 0..1
+5. Субсемплюємо (кожну N-ту точку) для швидкості
+6. Для кожного кліпу cam2 ковзаємо його огинаючу по огинаючій ref,
+   рахуємо Пірсонову кореляцію на кожному зсуві
+7. Максимум кореляції ≥ 0.3 → матч, зсув = позиція максимуму
+8. Без матчу → в кінець таймлайну
 
 Без numpy/scipy — чистий Python + ffmpeg.
 """
@@ -32,14 +33,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── Параметри ───────────────────────────────────────────────────────────────
 
-SAMPLE_RATE = 8000       # для піків достатньо
-ENVELOPE_WINDOW = 800    # вікно огинаючої (~100мс при 8000Hz)
-PEAK_MIN_DISTANCE = 2400 # мін. відстань між піками (~300мс)
-PEAK_THRESHOLD = 0.3     # поріг від максимуму огинаючої
-MIN_PEAKS = 3            # мінімум піків для порівняння
-INTERVAL_TOLERANCE = 0.05  # 50мс допуск для інтервалів
-INTENSITY_TOLERANCE = 0.25 # 25% допуск для інтенсивності
-MIN_MATCH_RATIO = 0.60   # мінімум 60% співпадінь
+SAMPLE_RATE = 8000       # 8kHz — достатньо для огинаючої
+ENV_WINDOW = 1600        # вікно огинаючої (~200мс при 8000Hz)
+SUBSAMPLE = 80           # субсемплювання огинаючої (кожна 80-та точка = 100 точок/сек)
+MIN_CORR = 0.3           # мінімальна Пірсонова кореляція для матчу
 SEARCH_WINDOW = 10       # скільки рефів перевіряємо навколо search_start
 
 
@@ -79,63 +76,33 @@ def get_file_sort_key(clip):
     return name
 
 
-# ─── Піки (всплески) ─────────────────────────────────────────────────────────
+# ─── Огинаюча + крос-кореляція ─────────────────────────────────────────────
 
-def compute_envelope(audio, window=ENVELOPE_WINDOW):
-    """Огинаюча = ковзне середнє від |сигналу|. Повертає список float."""
+def compute_envelope(audio, window=ENV_WINDOW, subsample=SUBSAMPLE):
+    """
+    Огинаюча = ковзне середнє від |сигналу|, субсемпльована.
+    Повертає список float (нормалізований 0..1).
+    """
     n = len(audio)
     if n < window:
-        return [0.0] * n
+        return []
     abs_audio = [abs(s) for s in audio]
     half_w = window // 2
-    # Кумулятивна сума для швидкого обчислення
+    # Кумулятивна сума для O(1) на точку
     cumsum = [0.0] * (n + 1)
     for i in range(n):
         cumsum[i + 1] = cumsum[i] + abs_audio[i]
-    env = [0.0] * n
-    for i in range(n):
+    # Субсемплюємо: беремо кожну subsample-ту точку
+    env = []
+    for i in range(0, n, subsample):
         lo = max(0, i - half_w)
         hi = min(n, i + half_w + 1)
-        env[i] = (cumsum[hi] - cumsum[lo]) / (hi - lo)
+        env.append((cumsum[hi] - cumsum[lo]) / (hi - lo))
+    # Нормалізуємо 0..1
+    mx = max(env) if env else 0.0
+    if mx > 0:
+        env = [v / mx for v in env]
     return env
-
-
-def find_peaks(audio, sample_rate=SAMPLE_RATE,
-               envelope_window=ENVELOPE_WINDOW,
-               min_distance=PEAK_MIN_DISTANCE,
-               threshold_ratio=PEAK_THRESHOLD):
-    """
-    Знаходить всплески в аудіо.
-    Повертає список (час_сек, інтенсивність_нормалізована).
-    """
-    if len(audio) < envelope_window * 2:
-        return []
-
-    env = compute_envelope(audio, envelope_window)
-    max_env = max(env) if env else 0.0
-    if max_env < 100:  # тиша
-        return []
-
-    threshold = max_env * threshold_ratio
-    peaks = []
-    last_peak_pos = -min_distance * 2  # щоб перший пік завжди пройшов
-
-    # Шукаємо локальні максимуми вище порогу
-    for i in range(1, len(env) - 1):
-        if env[i] < threshold:
-            continue
-        if i - last_peak_pos < min_distance:
-            # Якщо цей пік вищий за попередній у вікні — замінюємо
-            if peaks and env[i] > peaks[-1][1] * max_env:
-                peaks[-1] = (i / sample_rate, env[i] / max_env)
-                last_peak_pos = i
-            continue
-        # Локальний максимум (вище сусідів)
-        if env[i] >= env[i - 1] and env[i] >= env[i + 1]:
-            peaks.append((i / sample_rate, env[i] / max_env))
-            last_peak_pos = i
-
-    return peaks
 
 
 def extract_fragment_audio(audio, in_frame, out_frame, timebase, sample_rate=SAMPLE_RATE):
@@ -149,83 +116,61 @@ def extract_fragment_audio(audio, in_frame, out_frame, timebase, sample_rate=SAM
     return audio[in_sample:out_sample]
 
 
-# ─── Порівняння відбитків ─────────────────────────────────────────────────────
+def pearson(a, b):
+    """Пірсонова кореляція двох списків однакової довжини. Повертає -1..1."""
+    n = len(a)
+    if n < 5:
+        return 0.0
+    sum_a = sum(a)
+    sum_b = sum(b)
+    sum_ab = sum(x * y for x, y in zip(a, b))
+    sum_a2 = sum(x * x for x in a)
+    sum_b2 = sum(x * x for x in b)
+    num = n * sum_ab - sum_a * sum_b
+    den = math.sqrt((n * sum_a2 - sum_a * sum_a) * (n * sum_b2 - sum_b * sum_b))
+    if den < 1e-12:
+        return 0.0
+    return num / den
 
-def compute_intervals(peaks):
-    """Інтервали між сусідніми піками + їх інтенсивність."""
-    intervals = []
-    for i in range(1, len(peaks)):
-        dt = peaks[i][0] - peaks[i - 1][0]
-        intensity = (peaks[i - 1][1] + peaks[i][1]) / 2.0
-        intervals.append((dt, intensity))
-    return intervals
 
-
-def match_peaks(peaks_ref, peaks_tgt,
-                interval_tol=INTERVAL_TOLERANCE,
-                intensity_tol=INTENSITY_TOLERANCE,
-                min_ratio=MIN_MATCH_RATIO):
+def find_offset_envelope(env_ref, env_tgt, subsample=SUBSAMPLE, sample_rate=SAMPLE_RATE):
     """
-    Порівнює піки двох кліпів методом ковзного вікна.
+    Ковзаємо env_tgt по env_ref, рахуємо Пірсонову кореляцію.
 
-    Для кожного можливого зсуву перевіряємо:
-    - чи збігаються інтервали між піками (±50мс)
-    - чи збігаються інтенсивності (±25%)
-
-    Повертає (offset_sec, match_ratio, matched_count) або None.
-    Offset = на скільки секунд tgt зсунути щоб він збігся з ref.
+    Повертає (offset_sec, correlation) або (0, 0) якщо не знайшли.
+    offset_sec: на скільки секунд tgt зсунути щоб збігся з ref.
     """
-    if len(peaks_ref) < MIN_PEAKS or len(peaks_tgt) < MIN_PEAKS:
-        return None
+    n_ref = len(env_ref)
+    n_tgt = len(env_tgt)
+    if n_tgt < 5 or n_ref < 5:
+        return 0.0, 0.0
 
-    best_offset = 0.0
-    best_ratio = 0.0
-    best_matched = 0
+    # Якщо tgt довший за ref — теж ковзаємо, просто в обидва боки
+    # Діапазон зсувів: від -(n_tgt-1) до (n_ref-1)
+    # Але для швидкості обмежимо: tgt повністю або частково перекриває ref
+    best_corr = -2.0
+    best_offset_idx = 0
 
-    # Пробуємо всі можливі зіставлення першого піку tgt з кожним піком ref
-    for ri in range(len(peaks_ref)):
-        # Зсув = ref_peak_time - tgt_peak_time
-        offset = peaks_ref[ri][0] - peaks_tgt[0][0]
+    # Мінімальне перекриття = max(5, 30% від меншого)
+    min_overlap = max(5, int(0.3 * min(n_tgt, n_ref)))
 
-        matched = 0
-        total_compared = 0
+    for offset in range(-(n_tgt - min_overlap), n_ref - min_overlap + 1):
+        # ref[offset : offset + n_tgt] порівнюємо з tgt[0 : n_tgt]
+        ref_start = max(0, offset)
+        ref_end = min(n_ref, offset + n_tgt)
+        tgt_start = ref_start - offset
+        tgt_end = ref_end - offset
+        overlap = ref_end - ref_start
+        if overlap < min_overlap:
+            continue
+        c = pearson(env_ref[ref_start:ref_end], env_tgt[tgt_start:tgt_end])
+        if c > best_corr:
+            best_corr = c
+            best_offset_idx = offset
 
-        for ti in range(len(peaks_tgt)):
-            tgt_time = peaks_tgt[ti][0] + offset
-            tgt_intensity = peaks_tgt[ti][1]
-
-            # Шукаємо найближчий пік у ref
-            best_dist = float('inf')
-            best_ri_match = -1
-            for rj in range(len(peaks_ref)):
-                dist = abs(peaks_ref[rj][0] - tgt_time)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_ri_match = rj
-
-            total_compared += 1
-
-            if best_dist <= interval_tol and best_ri_match >= 0:
-                # Перевіряємо інтенсивність
-                ref_intensity = peaks_ref[best_ri_match][1]
-                if ref_intensity > 0:
-                    intensity_diff = abs(tgt_intensity - ref_intensity) / ref_intensity
-                else:
-                    intensity_diff = abs(tgt_intensity - ref_intensity)
-                if intensity_diff <= intensity_tol:
-                    matched += 1
-
-        if total_compared > 0:
-            ratio = matched / total_compared
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_offset = offset
-                best_matched = matched
-
-    if best_ratio < min_ratio or best_matched < MIN_PEAKS:
-        return None
-
-    return best_offset, best_ratio, best_matched
+    # Конвертуємо індекс субсемплів → секунди
+    offset_sec = best_offset_idx * subsample / sample_rate
+    return offset_sec, best_corr
 
 
 # ─── XML ─────────────────────────────────────────────────────────────────────
@@ -598,62 +543,62 @@ class SyncApp:
                 if ref_ok == 0 or tgt_ok == 0:
                     raise RuntimeError("Не вдалося витягнути аудіо з файлів")
 
-                # ── Степ 3: знаходимо піки для всіх кліпів (паралельно) ──
-                progress("Шукаю піки...")
+                # ── Степ 3: обчислюємо огинаючі (паралельно) ──
+                progress("Обчислюю огинаючі...")
 
-                def get_peaks_for_clip(clip, is_ref):
+                def get_envelope_for_clip(clip, is_ref):
                     audio = audio_data.get(clip['id'])
                     if audio is None:
                         return clip, []
                     if is_ref:
-                        # Для рефу — повне аудіо
-                        peaks = find_peaks(audio)
+                        # Для рефу — повне аудіо файлу
+                        env = compute_envelope(audio)
                     else:
-                        # Для цілі — тільки in..out
+                        # Для цілі — тільки in..out фрагмент
                         fragment = extract_fragment_audio(
                             audio, clip['in'], clip['out'], self.timebase)
                         if fragment is None:
                             return clip, []
-                        peaks = find_peaks(fragment)
-                    return clip, peaks
+                        env = compute_envelope(fragment)
+                    return clip, env
 
-                peaks_data = {}
+                env_data = {}
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                    ref_futures = [pool.submit(get_peaks_for_clip, c, True)
+                    ref_futures = [pool.submit(get_envelope_for_clip, c, True)
                                    for c in ref_clips]
-                    tgt_futures = [pool.submit(get_peaks_for_clip, c, False)
+                    tgt_futures = [pool.submit(get_envelope_for_clip, c, False)
                                    for c in tgt_clips]
                     for future in as_completed(ref_futures + tgt_futures):
-                        clip, peaks = future.result()
-                        peaks_data[clip['id']] = peaks
+                        clip, env = future.result()
+                        env_data[clip['id']] = env
                         progress()
 
-                ref_peaks_ok = sum(1 for c in ref_clips
-                                   if len(peaks_data.get(c['id'], [])) >= MIN_PEAKS)
-                tgt_peaks_ok = sum(1 for c in tgt_clips
-                                   if len(peaks_data.get(c['id'], [])) >= MIN_PEAKS)
-                progress(f"Піки: {ref_peaks_ok}/{len(ref_clips)} реф (≥{MIN_PEAKS}), "
-                         f"{tgt_peaks_ok}/{len(tgt_clips)} ціль")
+                ref_env_ok = sum(1 for c in ref_clips
+                                 if len(env_data.get(c['id'], [])) >= 5)
+                tgt_env_ok = sum(1 for c in tgt_clips
+                                 if len(env_data.get(c['id'], [])) >= 5)
+                progress(f"Огинаючі: {ref_env_ok}/{len(ref_clips)} реф, "
+                         f"{tgt_env_ok}/{len(tgt_clips)} ціль")
 
-                # ── Степ 4: порівнюємо піки — ковзне вікно ──
-                progress("Порівнюю відбитки...")
+                # ── Степ 4: крос-кореляція огинаючих — ковзне вікно ──
+                progress("Порівнюю огинаючі...")
                 synced = 0
                 unmatched = []
+                match_results = {}   # tgt_id → {ref_name, corr, offset_sec, ...}
                 search_start = 0
 
                 for i, tgt_clip in enumerate(tgt_clips):
-                    tgt_peaks = peaks_data.get(tgt_clip['id'], [])
-                    if len(tgt_peaks) < MIN_PEAKS:
+                    env_tgt = env_data.get(tgt_clip['id'], [])
+                    if len(env_tgt) < 5:
                         unmatched.append(tgt_clip)
                         progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"мало піків ({len(tgt_peaks)}) → в кінець")
+                                 f"коротка огинаюча ({len(env_tgt)} точок) → в кінець")
                         continue
 
-                    best_ratio = 0.0
+                    best_corr = -2.0
                     best_offset_sec = 0.0
                     best_ref_name = ""
                     best_ref_idx = search_start
-                    best_matched = 0
 
                     # Пошук: від search_start з вікном
                     window_from = max(0, search_start - SEARCH_WINDOW)
@@ -666,38 +611,35 @@ class SyncApp:
 
                     for ri in range(window_from, window_to):
                         ref_clip = ref_clips[ri]
-                        ref_peaks = peaks_data.get(ref_clip['id'], [])
-                        if len(ref_peaks) < MIN_PEAKS:
+                        env_ref = env_data.get(ref_clip['id'], [])
+                        if len(env_ref) < 5:
                             continue
 
-                        result = match_peaks(ref_peaks, tgt_peaks)
-                        if result is None:
-                            continue
-
-                        offset_sec, ratio, matched = result
-                        if ratio > best_ratio or (ratio == best_ratio and matched > best_matched):
-                            best_ratio = ratio
+                        offset_sec, corr = find_offset_envelope(env_ref, env_tgt)
+                        if corr > best_corr:
+                            best_corr = corr
                             best_offset_sec = offset_sec
                             best_ref_name = ref_clip.get('name', '?')
                             best_ref_idx = ri
-                            best_matched = matched
 
-                    if best_ratio < MIN_MATCH_RATIO or best_matched < MIN_PEAKS:
+                    if best_corr < MIN_CORR:
                         unmatched.append(tgt_clip)
                         progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
-                                 f"без матчу (best {best_ratio:.0%}) → в кінець")
+                                 f"без матчу (best corr={best_corr:.3f}) → в кінець")
+                        match_results[tgt_clip['id']] = {
+                            'matched': False, 'best_corr': best_corr,
+                            'best_ref': best_ref_name}
                         continue
 
                     # Обчислюємо нову позицію
-                    # ref_clip починається на таймлайні = ref_start
-                    # ref_audio[0] = файл[0]
-                    # offset_sec = на скільки зсунути tgt щоб збігся з ref
-                    # tgt_in_sec = in / timebase (початок фрагмента у файлі)
-                    # new_start_sec = ref_file_start_sec + offset_sec + tgt_in_sec
+                    # ref_clip починається на таймлайні: start=ref_start, in=ref_in
+                    # ref_file_start = початок файлу на таймлайні = start - in
+                    # offset_sec = на скільки (у секундах) tgt-огинаюча зсунута
+                    #   відносно початку ref-файлу
+                    # Нова позиція tgt на таймлайні = ref_file_start + offset_sec
                     ref_clip = ref_clips[best_ref_idx]
                     ref_file_start_sec = (ref_clip['start'] - ref_clip['in']) / self.timebase
 
-                    tgt_in_sec = tgt_clip['in'] / self.timebase
                     new_start_sec = ref_file_start_sec + best_offset_sec
                     new_start_frame = int(round(new_start_sec * self.timebase))
 
@@ -709,10 +651,14 @@ class SyncApp:
                     synced += 1
                     search_start = best_ref_idx
 
+                    match_results[tgt_clip['id']] = {
+                        'matched': True, 'best_corr': best_corr,
+                        'best_ref': best_ref_name, 'offset_sec': best_offset_sec,
+                        'old_start': old_start, 'new_start': new_start_frame}
+
                     progress(f"  [{i+1}/{len(tgt_clips)}] {tgt_clip['name']}: "
                              f"{old_start}→{new_start_frame} (Δ{delta:+d}) "
-                             f"матч={best_ref_name} {best_ratio:.0%} "
-                             f"({best_matched} піків)")
+                             f"матч={best_ref_name} corr={best_corr:.3f}")
 
                 # ── Степ 5: кліпи без матчу — в кінець ──
                 if unmatched:
@@ -729,8 +675,8 @@ class SyncApp:
                 # ── Дебаг-файл ──
                 if self.debug_var.get():
                     self._write_debug(
-                        ref_clips, tgt_clips, peaks_data, audio_data,
-                        synced, unmatched)
+                        ref_clips, tgt_clips, env_data, audio_data,
+                        match_results, synced, unmatched)
 
                 self.root.after(0, lambda: self._sync_done(
                     synced, len(unmatched)))
@@ -742,8 +688,8 @@ class SyncApp:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _write_debug(self, ref_clips, tgt_clips, peaks_data, audio_data,
-                      synced_count, unmatched_clips):
+    def _write_debug(self, ref_clips, tgt_clips, env_data, audio_data,
+                      match_results, synced_count, unmatched_clips):
         """Записує детальний дебаг-файл поруч зі скриптом."""
         import datetime
         debug_path = os.path.join(
@@ -759,13 +705,31 @@ class SyncApp:
                         f"без матчу {len(unmatched_clips)}\n")
                 f.write(f"\n{'─' * 70}\n")
 
+                def env_summary(env, max_points=30):
+                    """Коротке текстове представлення огинаючої."""
+                    if not env:
+                        return "(порожня)"
+                    n = len(env)
+                    avg = sum(env) / n
+                    mx = max(env)
+                    mn = min(env)
+                    # Мініатюра (перші max_points точок)
+                    step = max(1, n // max_points)
+                    mini = [env[j] for j in range(0, n, step)][:max_points]
+                    bar = ''.join('█' if v > 0.7 else '▓' if v > 0.4
+                                  else '░' if v > 0.1 else ' ' for v in mini)
+                    dur_sec = n * SUBSAMPLE / SAMPLE_RATE
+                    return (f"{n} точок ({dur_sec:.1f}s), "
+                            f"avg={avg:.3f} min={mn:.3f} max={mx:.3f}\n"
+                            f"             |{bar}|")
+
                 # ── Референсна доріжка ──
                 f.write(f"\n▶ РЕФЕРЕНС ({len(ref_clips)} кліпів):\n")
                 for i, c in enumerate(ref_clips):
                     audio = audio_data.get(c['id'])
                     audio_len = len(audio) if audio else 0
                     audio_dur = f"{audio_len / SAMPLE_RATE:.1f}s" if audio_len else "N/A"
-                    peaks = peaks_data.get(c['id'], [])
+                    env = env_data.get(c['id'], [])
                     fp = pathurl_to_filepath(c['pathurl']) if c['pathurl'] else 'N/A'
 
                     f.write(f"\n  [{i}] {c['name']}\n")
@@ -776,22 +740,7 @@ class SyncApp:
                             f"dur={c['duration']}\n")
                     f.write(f"      Аудіо: {audio_dur} "
                             f"({audio_len} семплів @ {SAMPLE_RATE}Hz)\n")
-                    f.write(f"      Піки ({len(peaks)}):")
-                    if peaks:
-                        f.write('\n')
-                        for pi, (t, intens) in enumerate(peaks):
-                            f.write(f"        пік[{pi}]: t={t:.3f}s "
-                                    f"інтенс={intens:.3f}\n")
-                        # Інтервали
-                        if len(peaks) >= 2:
-                            f.write(f"      Інтервали: ")
-                            intervals = []
-                            for pi in range(1, len(peaks)):
-                                dt = peaks[pi][0] - peaks[pi-1][0]
-                                intervals.append(f"{dt:.3f}s")
-                            f.write(", ".join(intervals) + "\n")
-                    else:
-                        f.write(" (немає)\n")
+                    f.write(f"      Огинаюча: {env_summary(env)}\n")
 
                 f.write(f"\n{'─' * 70}\n")
 
@@ -802,7 +751,7 @@ class SyncApp:
                     audio = audio_data.get(c['id'])
                     audio_len = len(audio) if audio else 0
                     audio_dur = f"{audio_len / SAMPLE_RATE:.1f}s" if audio_len else "N/A"
-                    peaks = peaks_data.get(c['id'], [])
+                    env = env_data.get(c['id'], [])
                     fp = pathurl_to_filepath(c['pathurl']) if c['pathurl'] else 'N/A'
                     status = "БЕЗ МАТЧУ" if c['name'] in unmatched_names else "OK"
 
@@ -817,34 +766,28 @@ class SyncApp:
                             f"{c['out']/self.timebase:.2f}s "
                             f"= {(c['out']-c['in'])/self.timebase:.2f}s\n")
                     f.write(f"      Аудіо файлу: {audio_dur}\n")
-                    f.write(f"      Піки фрагмента ({len(peaks)}):")
-                    if peaks:
-                        f.write('\n')
-                        for pi, (t, intens) in enumerate(peaks):
-                            f.write(f"        пік[{pi}]: t={t:.3f}s "
-                                    f"інтенс={intens:.3f}\n")
-                        if len(peaks) >= 2:
-                            f.write(f"      Інтервали: ")
-                            intervals = []
-                            for pi in range(1, len(peaks)):
-                                dt = peaks[pi][0] - peaks[pi-1][0]
-                                intervals.append(f"{dt:.3f}s")
-                            f.write(", ".join(intervals) + "\n")
-                    else:
-                        f.write(" (немає)\n")
+                    f.write(f"      Огинаюча фрагм: {env_summary(env)}\n")
+
+                    # Результат матчу
+                    mr = match_results.get(c['id'])
+                    if mr:
+                        if mr['matched']:
+                            f.write(f"      ✓ МАТЧ: ref={mr['best_ref']} "
+                                    f"corr={mr['best_corr']:.4f} "
+                                    f"offset={mr['offset_sec']:.3f}s "
+                                    f"pos: {mr['old_start']}→{mr['new_start']}\n")
+                        else:
+                            f.write(f"      ✗ Без матчу: best corr={mr['best_corr']:.4f} "
+                                    f"(ref={mr['best_ref']})\n")
 
                 f.write(f"\n{'─' * 70}\n")
 
                 # ── Параметри алгоритму ──
                 f.write(f"\n▶ ПАРАМЕТРИ:\n")
                 f.write(f"  SAMPLE_RATE = {SAMPLE_RATE}\n")
-                f.write(f"  ENVELOPE_WINDOW = {ENVELOPE_WINDOW}\n")
-                f.write(f"  PEAK_MIN_DISTANCE = {PEAK_MIN_DISTANCE}\n")
-                f.write(f"  PEAK_THRESHOLD = {PEAK_THRESHOLD}\n")
-                f.write(f"  MIN_PEAKS = {MIN_PEAKS}\n")
-                f.write(f"  INTERVAL_TOLERANCE = {INTERVAL_TOLERANCE}\n")
-                f.write(f"  INTENSITY_TOLERANCE = {INTENSITY_TOLERANCE}\n")
-                f.write(f"  MIN_MATCH_RATIO = {MIN_MATCH_RATIO}\n")
+                f.write(f"  ENV_WINDOW = {ENV_WINDOW}\n")
+                f.write(f"  SUBSAMPLE = {SUBSAMPLE}\n")
+                f.write(f"  MIN_CORR = {MIN_CORR}\n")
                 f.write(f"  SEARCH_WINDOW = {SEARCH_WINDOW}\n")
 
                 f.write(f"\n{'═' * 70}\n")
